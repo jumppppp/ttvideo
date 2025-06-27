@@ -18,6 +18,7 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*sipPyTypeDict.*")
 # 录制时长
 all_time = 0
+fps_sleep ={15:0.06,24:0.004,30:0.03,60:0.015,120:0.008}
 
 class PreviewThread(QtCore.QThread):
     frame_ready = QtCore.pyqtSignal(np.ndarray)
@@ -283,6 +284,7 @@ class RecordingThread(QtCore.QThread):
 
     def run(self):
         global all_time
+        global fps_sleep
         current_time = time.strftime("%Y%m%d_%H%M%S")
         output_path = f"./output/recording_{current_time}.mp4"
         self.recorder.output_path = output_path
@@ -351,9 +353,7 @@ class RecordingThread(QtCore.QThread):
                         )
                         self.last_log_time = current_time
                     
-
                     if self.recorder.fps > 50:
-                        # time.sleep(1.0/(self.recorder.fps+5))
                         pass
                     else:
                                             # 精确控制帧率
@@ -365,7 +365,6 @@ class RecordingThread(QtCore.QThread):
                         else:
                             # 帧处理超时，调整下一帧时间
                             next_frame_time = time.time()
-                    # time.sleep(1.0/(self.recorder.fps+5))
                 else:
                     time.sleep(0.1)
             except Exception as e:
@@ -449,7 +448,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         self.start_time = 0
         self.total_pause_time = 0
         self.pause_start_time = 0
-        self.fps = 30  # 默认帧率设为30
+        self.fps = 24  # 默认帧率设为30
         self.resolution = (1920, 1080)
         self.blur_process_names = []  # 替换原来的blur_pids
         self.output_path = ""
@@ -488,7 +487,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         self.ui.comboBox.addItems(resolutions)
         self.ui.comboBox_2.addItems(["15", "24", "30","45","60"])
         self.ui.comboBox.setCurrentText(f"{self.screen_width}x{self.screen_height}")
-        self.ui.comboBox_2.setCurrentText("30")
+        self.ui.comboBox_2.setCurrentText("24")
 
         # 初始按钮状态
         self.ui.pushButton.setEnabled(True)
@@ -521,16 +520,28 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         """启动预览线程"""
         if not self.camera:
             try:
-                self.camera = dxcam.create(
-                    output_idx=0, 
-                    output_color="BGR",
-                    max_buffer_len=256
-                )
-                if self.camera:
-                    self.camera.start(target_fps=60, video_mode=True)
-                    self.update_status(f"截图设备初始化成功")
+                # 尝试不同设备索引
+                for output_idx in range(4):  # 最多尝试4个设备
+                    try:
+                        self.camera = dxcam.create(
+                            output_idx=output_idx,
+                            output_color="BGR",
+                            max_buffer_len=256
+                        )
+                        if self.camera:
+                            self.camera.start(target_fps=60, video_mode=True)
+                            self.update_status(f"截图设备 #{output_idx} 初始化成功")
+                            break
+                    except Exception as e:
+                        self.update_status(f"尝试设备 #{output_idx} 失败: {str(e)}")
+                else:
+                    # 所有硬件设备失败后尝试软件实现
+                    self.camera = dxcam.create(output_idx=None)
+                    self.camera.start(target_fps=30, video_mode=True)
+                    self.update_status("使用软件模式初始化成功")
+                
             except Exception as e:
-                error_msg = f"初始化截图设备失败: {str(e)}"
+                error_msg = f"初始化截图设备失败: {str(e)}\n可能原因：\n1. 显卡驱动未更新\n2. 系统缺少DirectX 11+支持\n3. 双显卡切换设置问题"
                 self.update_status(error_msg)
                 return
         
@@ -780,3 +791,6 @@ if __name__ == '__main__':
     recorder.show()
     
     sys.exit(app.exec())
+    
+    
+# --exclude PyQt5 --exclude sip 
