@@ -5,17 +5,17 @@ import numpy as np
 import psutil
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtCore import Qt
 import pyautogui
 from ui import Ui_MainWindow
 import os
 import win32gui
 import win32process
 import dxcam
-import threading
 import subprocess
 import traceback
 import GPUtil
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*sipPyTypeDict.*")
 # 录制时长
 all_time = 0
 
@@ -24,46 +24,22 @@ class PreviewThread(QtCore.QThread):
     performance_updated = QtCore.pyqtSignal(str)
     error_occurred = QtCore.pyqtSignal(str)
 
-    def __init__(self, blur_process_names):
-        super().__init__(parent=None)
+    def __init__(self, blur_process_names,camera=None):
+        super().__init__()
         self.blur_process_names  = [kw.lower() for kw in blur_process_names]  # 存储小写关键字
         self._stop_flag = False
-        self.camera = None
+        self.camera = camera
         self.fps_counter = 0
         self.last_fps_time = time.time()
         self.screen_width, self.screen_height = pyautogui.size()
         self.retry_count = 0
 
-    def init_camera(self):
-        """初始化DXCam截图相机"""
-        try:
-            # 使用实际屏幕分辨率
-            self.camera = dxcam.create(
-                output_idx=0, 
-                output_color="BGR",
-                max_buffer_len=64  # 增加缓冲区大小
-            )
-            if self.camera:
-                self.camera.start(target_fps=30, video_mode=True)
-                return True
-            return False
-        except Exception as e:
-            error_msg = f"初始化DXCam失败: {str(e)}"
-            self.error_occurred.emit(error_msg)
-            traceback.print_exc()
-            return False
-
+   
     def run(self):
-        # 多次尝试初始化相机
-        while not self._stop_flag and not self.init_camera() and self.retry_count < 5:
-            self.retry_count += 1
-            self.error_occurred.emit(f"截图设备初始化失败，正在重试 ({self.retry_count}/5)...")
-            time.sleep(1)
-            
         if not self.camera:
-            self.error_occurred.emit("错误: 无法初始化截图设备，预览不可用")
+            self.error_occurred.emit("错误: 截图设备未初始化")
             return
-
+            
         self.performance_updated.emit("预览已启动")
         
         while not self._stop_flag:
@@ -142,18 +118,19 @@ class PreviewThread(QtCore.QThread):
                         if any(keyword in process_name for keyword in self.blur_process_names):
                             # 获取窗口坐标（保持原逻辑）
                             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                            # 确保坐标在屏幕范围内
+                            left = max(0, left)
+                            top = max(0, top)
+                            right = min(self.screen_width, right)
+                            bottom = min(self.screen_height, bottom)
                             width = right - left
                             height = bottom - top
                             
-                            if (width > 10 and height > 10 and 
-                                left >= 0 and top >= 0 and
-                                left + width <= self.screen_width and
-                                top + height <= self.screen_height):
-                                
-                                window_region = processed_frame[top:top+height, left:left+width]
+                            if width > 10 and height > 10:
+                                window_region = processed_frame[top:bottom, left:right]
                                 if window_region.size > 0:
                                     blurred_region = self.fast_blur(window_region)
-                                    processed_frame[top:top+height, left:left+width] = blurred_region
+                                    processed_frame[top:bottom, left:right] = blurred_region
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         # 进程已结束或无权限访问时跳过
                         pass
@@ -169,11 +146,7 @@ class PreviewThread(QtCore.QThread):
 
     def stop(self):
         self._stop_flag = True
-        if self.camera:
-            try:
-                self.camera.stop()
-            except:
-                pass
+
         self.wait(2000)  # 最多等待2秒
 
 class RecordingThread(QtCore.QThread):
@@ -181,35 +154,18 @@ class RecordingThread(QtCore.QThread):
     performance_updated = QtCore.pyqtSignal(str)
     error_occurred = QtCore.pyqtSignal(str)
     
-    def __init__(self, recorder):
+    def __init__(self, recorder,camera=None):
         super().__init__(parent=None)
         self.recorder = recorder
         self._stop_flag = False
         self._pause_flag = False
         self.frame_count = 0
-        self.camera = None
+        self.camera = camera
         self.writer = None
         self.last_log_time = time.time()
         self.start_time = time.time()
         self.screen_width, self.screen_height = pyautogui.size()
 
-    def init_camera(self):
-        """初始化DXCam截图相机"""
-        try:
-            self.camera = dxcam.create(
-                output_idx=0, 
-                output_color="BGR",
-                max_buffer_len=128  # 更大的缓冲区
-            )
-            if self.camera:
-                self.camera.start(target_fps=self.recorder.fps, video_mode=True)
-                return True
-            return False
-        except Exception as e:
-            error_msg = f"录制截图设备初始化失败: {str(e)}"
-            self.error_occurred.emit(error_msg)
-            traceback.print_exc()
-            return False
     def check_hardware_support(self):
         """检查系统硬件编码支持"""
         support = {
@@ -335,9 +291,10 @@ class RecordingThread(QtCore.QThread):
         if self.recorder.resolution[0] <= 0 or self.recorder.resolution[1] <= 0:
             self.recorder.resolution = (1920, 1080)
 
-        # 初始化截图设备
-        if not self.init_camera():
-            self.error_occurred.emit("错误: 无法初始化截图设备")
+        # 使用主窗口的相机实例
+        self.camera = self.recorder.camera
+        if not self.camera:
+            self.error_occurred.emit("错误: 截图设备未初始化")
             return
 
         # 初始化视频写入器
@@ -394,14 +351,21 @@ class RecordingThread(QtCore.QThread):
                         )
                         self.last_log_time = current_time
                     
-                    # 精确控制帧率
-                    next_frame_time += target_interval
-                    sleep_time = next_frame_time - time.time()
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
+
+                    if self.recorder.fps > 50:
+                        # time.sleep(1.0/(self.recorder.fps+5))
+                        pass
                     else:
-                        # 帧处理超时，调整下一帧时间
-                        next_frame_time = time.time()
+                                            # 精确控制帧率
+                        next_frame_time += target_interval
+                        sleep_time = next_frame_time - time.time()
+                        if sleep_time > 0:
+                            
+                            time.sleep(sleep_time)
+                        else:
+                            # 帧处理超时，调整下一帧时间
+                            next_frame_time = time.time()
+                    # time.sleep(1.0/(self.recorder.fps+5))
                 else:
                     time.sleep(0.1)
             except Exception as e:
@@ -412,8 +376,8 @@ class RecordingThread(QtCore.QThread):
         try:
             if self.writer:
                 self.writer.release()
-            if self.camera:
-                self.camera.stop()
+            # if self.camera:
+            #     self.camera.stop()
         except:
             pass
         
@@ -442,7 +406,7 @@ class TimeDisplayThread(QtCore.QThread):
     time_updated = QtCore.pyqtSignal(str)
 
     def __init__(self, recorder):
-        super().__init__(parent=None)
+        super().__init__()
         self.recorder = recorder
         self._stop_flag = False
         self.last_recorded_time = 0
@@ -475,7 +439,7 @@ class TimeDisplayThread(QtCore.QThread):
         self.wait()
 class ScreenRecorder(QtWidgets.QMainWindow):
     def __init__(self):
-        super().__init__(parent=None)
+        super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
 
@@ -485,14 +449,14 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         self.start_time = 0
         self.total_pause_time = 0
         self.pause_start_time = 0
-        self.fps = 24  # 默认帧率设为30
+        self.fps = 30  # 默认帧率设为30
         self.resolution = (1920, 1080)
         self.blur_process_names = []  # 替换原来的blur_pids
         self.output_path = ""
         self.recording_thread = None
-        # self.screen_width, self.screen_height = pyautogui.size()
+        self.screen_width, self.screen_height = pyautogui.size()
         # 添加共享的 DXCamera 实例
-        # self.shared_camera = None
+        self.camera = None
         
         # 在创建预览和录制线程时传递共享实例
 
@@ -516,15 +480,15 @@ class ScreenRecorder(QtWidgets.QMainWindow):
 
         # 初始化分辨率选项
         resolutions = [
-            # f"{self.screen_width}x{self.screen_height}",
+            f"{self.screen_width}x{self.screen_height}",
             "1920x1080", 
             "1280x720", 
             "800x600"
         ]
         self.ui.comboBox.addItems(resolutions)
-        self.ui.comboBox_2.addItems(["15", "24", "30"])
-        self.ui.comboBox.setCurrentText(f"1920x1080")
-        self.ui.comboBox_2.setCurrentText("24")
+        self.ui.comboBox_2.addItems(["15", "24", "30","45","60"])
+        self.ui.comboBox.setCurrentText(f"{self.screen_width}x{self.screen_height}")
+        self.ui.comboBox_2.setCurrentText("30")
 
         # 初始按钮状态
         self.ui.pushButton.setEnabled(True)
@@ -536,7 +500,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         
         # 初始化预览线程（稍后启动）
         # self.preview_thread = PreviewThread(self.blur_pids)
-        self.preview_thread = PreviewThread(self.blur_process_names)
+        self.preview_thread = PreviewThread(self.blur_process_names,self.camera)
         self.preview_thread.frame_ready.connect(self.update_preview)
         self.preview_thread.performance_updated.connect(self.update_status)
         self.preview_thread.error_occurred.connect(self.update_status)
@@ -555,6 +519,25 @@ class ScreenRecorder(QtWidgets.QMainWindow):
 
     def start_preview(self):
         """启动预览线程"""
+        if not self.camera:
+            try:
+                self.camera = dxcam.create(
+                    output_idx=0, 
+                    output_color="BGR",
+                    max_buffer_len=256
+                )
+                if self.camera:
+                    self.camera.start(target_fps=60, video_mode=True)
+                    self.update_status(f"截图设备初始化成功")
+            except Exception as e:
+                error_msg = f"初始化截图设备失败: {str(e)}"
+                self.update_status(error_msg)
+                return
+        
+        # 确保预览线程使用同一个实例
+        self.preview_thread.camera = self.camera
+        self.preview_thread.fps = self.fps
+        
         if not self.preview_thread.isRunning():
             self.preview_thread.start()
             self.update_status("正在启动预览...")
@@ -636,7 +619,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
             self.pause_start_time = 0
             
             # 创建录制线程
-            self.recording_thread = RecordingThread(self)
+            self.recording_thread = RecordingThread(self,self.camera)
             self.recording_thread.performance_updated.connect(self.update_status)
             self.recording_thread.error_occurred.connect(self.update_status)
             self.recording_thread.start()
@@ -689,7 +672,6 @@ class ScreenRecorder(QtWidgets.QMainWindow):
             self.ui.pushButton_3.setEnabled(False)
             self.ui.pushButton_2.setText("暂停/继续")
             
-            # 不要停止预览线程，让它继续运行
 
     def set_resolution(self, text):
         """设置分辨率"""
@@ -708,7 +690,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         except ValueError:
             self.update_status("错误: 无效的帧率格式")
 
-    def add_blur_process(self):  # 替换原来的add_blur_pid方法
+    def add_blur_process(self):
         """添加需要模糊的进程名称关键字"""
         process_text = self.ui.textEdit.toPlainText()  # 假设UI输入框用于输入进程名称
         keywords = [kw.strip().lower() for kw in process_text.split('\n') if kw.strip()]
@@ -743,16 +725,22 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         """关闭应用程序"""
         self.update_status("正在关闭应用程序...")
         
-        # 停止所有线程
         if self.preview_thread and self.preview_thread.isRunning():
             self.preview_thread.stop()
         
         if self.recording and self.recording_thread and self.recording_thread.isRunning():
             self.recording_thread.stop()
         
-        # 停止时间显示线程
         if self.time_display_thread and self.time_display_thread.isRunning():
             self.time_display_thread.stop()
+        
+        # 释放DXCam资源
+        if self.camera:
+            try:
+                self.camera.stop()
+                self.camera = None
+            except:
+                pass
         
         event.accept()
 
