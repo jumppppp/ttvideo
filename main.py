@@ -1,3 +1,4 @@
+import math
 import sys
 import time
 import cv2
@@ -15,10 +16,13 @@ import subprocess
 import traceback
 import GPUtil
 import warnings
+import platform
+import ctypes
+import subprocess
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*sipPyTypeDict.*")
 # 录制时长
 all_time = 0
-fps_sleep ={15:0.06,24:0.004,30:0.03,60:0.015,120:0.008}
+fps_sleep ={15:0.03,24:0.02,30:0.015,60:0.008}
 
 class PreviewThread(QtCore.QThread):
     frame_ready = QtCore.pyqtSignal(np.ndarray)
@@ -76,7 +80,7 @@ class PreviewThread(QtCore.QThread):
                 
                 # 控制帧率
                 elapsed = time.time() - start_time
-                sleep_time = max(0, 0.08 - elapsed)  # 目标30FPS预览
+                sleep_time = max(0, 0.06 - elapsed)  # 目标30FPS预览
                 time.sleep(sleep_time)
                 
             except Exception as e:
@@ -310,9 +314,7 @@ class RecordingThread(QtCore.QThread):
         self.frame_count = 0
         
         # 计算目标帧间隔
-        target_interval = 1.0 / self.recorder.fps
-        next_frame_time = time.time()
-        
+        self.fps = self.recorder.fps
         # 主录制循环
         while not self._stop_flag and self.recorder.recording:
             try:
@@ -324,10 +326,8 @@ class RecordingThread(QtCore.QThread):
                     frame = self.camera.get_latest_frame()
                     
                     if frame is None:
-                        # 等待下一帧
-                        sleep_time = next_frame_time - time.time()
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
+                        time.sleep(fps_sleep[self.fps])
+
                         continue
                     
                     # 应用模糊效果
@@ -343,28 +343,37 @@ class RecordingThread(QtCore.QThread):
                     self.frame_count += 1
                     
                     # 性能监控
-                    if current_time - self.last_log_time >= 5.0:
+                    if current_time - self.last_log_time >= 0.1:
                         elapsed = current_time - self.start_time
                         actual_fps = self.frame_count / elapsed
                         self.performance_updated.emit(
-                            f"录制FPS: {actual_fps:.1f}/{self.recorder.fps} | "
+                            f"录制FPS: {actual_fps:.1f}/{self.fps} | "
                             f"帧数: {self.frame_count} | "
                             f"文件: {os.path.basename(output_path)}"
                         )
                         self.last_log_time = current_time
-                    
-                    if self.recorder.fps > 50:
-                        pass
-                    else:
-                                            # 精确控制帧率
-                        next_frame_time += target_interval
-                        sleep_time = next_frame_time - time.time()
-                        if sleep_time > 0:
-                            
-                            time.sleep(sleep_time)
+                        
+                        
+                        if actual_fps < self.fps-0.5:
+                            if fps_sleep[self.fps] < 1e-33:
+                                fps_sleep[self.fps] = 0
+                                # self.error_occurred.emit(f"检测到帧率↓↓，休眠时间已达上限，无法再降低")
+                            else:
+                                rate = (0.9 *((actual_fps/self.fps)**((self.fps-actual_fps))))
+                                fps_sleep[self.fps] = fps_sleep[self.fps] *rate
+                                self.error_occurred.emit(f"检测到帧率↓↓，休眠时间下调至{fps_sleep[self.fps]}，比率为{rate}")
+    
+                        elif actual_fps > self.fps+0.5:
+                            if fps_sleep[self.fps] == 0:
+                                fps_sleep[self.fps] = 1.0/(self.fps*math.e)
+                            else:
+                                rate = (1.1 *((actual_fps/self.fps)**((actual_fps-self.fps))))
+                                fps_sleep[self.fps] = fps_sleep[self.fps] * rate
+                                self.error_occurred.emit(f"检测到帧率↑↑，休眠时间上调至{fps_sleep[self.fps]}，比率为{rate}")
                         else:
-                            # 帧处理超时，调整下一帧时间
-                            next_frame_time = time.time()
+                            pass
+                    time.sleep(fps_sleep[self.fps])
+
                 else:
                     time.sleep(0.1)
             except Exception as e:
@@ -448,6 +457,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         self.start_time = 0
         self.total_pause_time = 0
         self.pause_start_time = 0
+        self.MAX_LINES = 2000  # 设定最大行数
         self.fps = 24  # 默认帧率设为30
         self.resolution = (1920, 1080)
         self.blur_process_names = []  # 替换原来的blur_pids
@@ -485,7 +495,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
             "800x600"
         ]
         self.ui.comboBox.addItems(resolutions)
-        self.ui.comboBox_2.addItems(["15", "24", "30","45","60"])
+        self.ui.comboBox_2.addItems(["15", "24", "30","60"])
         self.ui.comboBox.setCurrentText(f"{self.screen_width}x{self.screen_height}")
         self.ui.comboBox_2.setCurrentText("24")
 
@@ -515,11 +525,21 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         super().showEvent(event)
         # 延迟启动预览线程，确保UI已完全初始化
         QtCore.QTimer.singleShot(500, self.start_preview)
-
+    
     def start_preview(self):
         """启动预览线程"""
+        try:
+            self.screen_fps = get_screen_refresh_rate()
+            if self.screen_fps > 60:
+                self.screen_fps = 120
+            self.update_status(f"检测到屏幕刷新率: {self.screen_fps}Hz")
+        except Exception as e:
+            self.update_status(f"检测屏幕刷新率失败: {str(e)}")
+            self.screen_fps = 60  # 默认值
+            self.update_status(f"使用默认刷新率: {self.screen_fps}Hz")
         if not self.camera:
             try:
+                
                 # 尝试不同设备索引
                 for output_idx in range(4):  # 最多尝试4个设备
                     try:
@@ -529,7 +549,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
                             max_buffer_len=256
                         )
                         if self.camera:
-                            self.camera.start(target_fps=60, video_mode=True)
+                            self.camera.start(target_fps=self.screen_fps, video_mode=True)
                             self.update_status(f"截图设备 #{output_idx} 初始化成功")
                             break
                     except Exception as e:
@@ -613,14 +633,23 @@ class ScreenRecorder(QtWidgets.QMainWindow):
         self.ui.label_2.setText(time_text)
     def update_status(self, message):
         """更新状态栏"""
+        
         timestamp = time.strftime('%H:%M:%S')
         self.ui.plainTextEdit_2.appendPlainText(f"[{timestamp}] {message}")
+        # 检查行数，超过则删除顶部行
+        while self.ui.plainTextEdit_2.document().lineCount() > self.MAX_LINES:
+            cursor = self.ui.plainTextEdit_2.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+            cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # 删除换行符
         # 自动滚动到底部
         self.ui.plainTextEdit_2.verticalScrollBar().setValue(
             self.ui.plainTextEdit_2.verticalScrollBar().maximum()
         )
 
     def start_recording(self):
+    
         """开始录制"""
         if not self.recording:
             self.recording = True
@@ -700,6 +729,7 @@ class ScreenRecorder(QtWidgets.QMainWindow):
             self.update_status(f"帧率设置为: {self.fps} FPS")
         except ValueError:
             self.update_status("错误: 无效的帧率格式")
+            
 
     def add_blur_process(self):
         """添加需要模糊的进程名称关键字"""
@@ -754,9 +784,51 @@ class ScreenRecorder(QtWidgets.QMainWindow):
                 pass
         
         event.accept()
-
-
+def get_screen_refresh_rate():
+    system = platform.system()
+    if system == "Windows":
+        # Windows 系统
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hdc = user32.GetDC(0)
+        refresh_rate = gdi32.GetDeviceCaps(hdc, 116)  # VREFRESH 常量值为 116
+        user32.ReleaseDC(0, hdc)
+        return refresh_rate
+    elif system == "Darwin":
+        # macOS 系统
+        try:
+            result = subprocess.run(['system_profiler', 'SPDisplaysDataType'], capture_output=True, text=True)
+            output = result.stdout
+            for line in output.split('\n'):
+                if 'Refresh Rate:' in line:
+                    refresh_rate = line.split(':')[1].strip().split(' ')[0]
+                    return float(refresh_rate)
+        except Exception as e:
+            print(f"获取刷新率失败: {e}")
+        return None
+    elif system == "Linux":
+        # Linux 系统
+        try:
+            result = subprocess.run(['xrandr', '--current'], capture_output=True, text=True)
+            output = result.stdout
+            for line in output.split('\n'):
+                if '*+' in line:
+                    parts = line.split()
+                    for part in parts:
+                        if '.' in part:
+                            try:
+                                refresh_rate = float(part)
+                                return refresh_rate
+                            except ValueError:
+                                continue
+        except Exception as e:
+            print(f"获取刷新率失败: {e}")
+        return None
+    else:
+        print("不支持的操作系统")
+        return None
 if __name__ == '__main__':
+
     app = QtWidgets.QApplication(sys.argv)
     
     # 设置应用程序样式
